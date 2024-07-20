@@ -1,75 +1,85 @@
 package main
 
 import (
-	"bufio"
 	"fmt"
 	"net"
 	"strings"
 )
 
 func main() {
-	// Initialize AOF
-	if err := initAOF("appendonly.aof"); err != nil {
-		fmt.Println("Error initializing AOF:", err)
-		return
-	}
-	defer aofFile.Close()
+	fmt.Println("Listening on port :6379")
 
-	ln, err := net.Listen("tcp", ":6379")
+	// Create a new server
+	l, err := net.Listen("tcp", ":6379")
 	if err != nil {
-		fmt.Println("Error setting up the server:", err)
+		fmt.Println(err)
 		return
 	}
-	defer ln.Close()
 
-	fmt.Println("Server is running on port 6379...")
+	aof, err := NewAof("database.aof")
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	defer aof.Close()
+
+	aof.Read(func(value Value) {
+		command := strings.ToUpper(value.array[0].bulk)
+		args := value.array[1:]
+
+		handler, ok := Handlers[command]
+		if !ok {
+			fmt.Println("Invalid command: ", command)
+			return
+		}
+
+		handler(args)
+	})
+
+	// Listen for connections
+	conn, err := l.Accept()
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+
+	defer conn.Close()
+
 	for {
-		conn, err := ln.Accept()
+		resp := NewResp(conn)
+		value, err := resp.Read()
 		if err != nil {
-			fmt.Println("Error accepting connection:", err)
+			fmt.Println(err)
+			return
+		}
+
+		if value.typ != "array" {
+			fmt.Println("Invalid request, expected array")
 			continue
 		}
-		go handleConnection(conn)
-	}
-}
 
-func handleConnection(conn net.Conn) {
-	defer conn.Close()
-	reader := bufio.NewReader(conn)
-	writer := bufio.NewWriter(conn)
-
-	for {
-		data, err := readResp(reader)
-		if err != nil {
-			fmt.Println("Error reading data:", err)
-			return
+		if len(value.array) == 0 {
+			fmt.Println("Invalid request, expected array length > 0")
+			continue
 		}
 
-		response := handleCommand(data)
-		if err := writeResp(writer, response); err != nil {
-			fmt.Println("Error writing response:", err)
-			return
-		}
-	}
-}
+		command := strings.ToUpper(value.array[0].bulk)
+		args := value.array[1:]
 
-func handleCommand(data interface{}) interface{} {
-	if cmd, ok := data.([]interface{}); ok && len(cmd) > 0 {
-		switch strings.ToLower(cmd[0].(string)) {
-		case "ping":
-			if len(cmd) > 1 {
-				return cmd[1]
-			}
-			return "PONG"
-		case "echo":
-			if len(cmd) > 1 {
-				return cmd[1]
-			}
-			return nil
+		writer := NewWriter(conn)
+
+		handler, ok := Handlers[command]
+		if !ok {
+			fmt.Println("Invalid command: ", command)
+			writer.Write(Value{typ: "string", str: ""})
+			continue
 		}
 
-		// Append the command to AOF
-		appendToAOF(cmd)
+		if command == "SET" || command == "HSET" {
+			aof.Write(value)
+		}
+
+		result := handler(args)
+		writer.Write(result)
 	}
-	return fmt.Errorf("unknown command")
 }
